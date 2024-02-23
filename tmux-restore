@@ -1,0 +1,55 @@
+#!/bin/bash
+
+DEST_DIR=~/.tmux-sessions/
+HOST=$(hostname -s)
+
+for fname in $DEST_DIR/${HOST}-*-panes ; do
+  session=$(head -n 1 $fname | cut -d ' ' -f 1)
+
+  if (tmux has-session -t $session 2>/dev/null); then
+    #tmux kill-session -t $session
+    continue;
+  fi
+
+  echo "Restoring session ${session}"
+  while read line; do
+    session=$(echo "$line" | cut -d ' ' -f 1)
+    window=$(echo "$line" | cut -d ' ' -f 2)
+    pane=$(echo "$line" | cut -d ' ' -f 3)
+    layout=$(echo "$line" | cut -d ' ' -f 4)
+
+    if !(tmux has-session -t $session 2>/dev/null); then
+      tmux new -d -s $session
+      if (( $window != 1 )); then
+        tmux move-window -d -s ${session}:1 -t ${session}:${window}
+      fi
+    fi
+
+    if !(tmux has-session -t $session:$window 2>/dev/null); then
+      tmux new-window -t $session:$window
+    fi
+
+    if !(tmux has-session -t $session:$window.$pane 2>/dev/null); then
+      tmux splitw -t $session:$window.0
+    fi
+
+    if (tmux has-session -t $session:$window 2>/dev/null); then
+      tmux select-layout -t $session:$window ${layout}
+    fi
+  done < $DEST_DIR/${HOST}-${session}-panes
+
+  while read line; do
+    session=$(echo "$line" | cut -d ' ' -f 1)
+    window=$(echo "$line" | cut -d ' ' -f 2)
+    pane=$(echo "$line" | cut -d ' ' -f 3)
+    session=${prefix}${session}
+
+    fname=$DEST_DIR/${HOST}-$session:$window.${pane}
+    path=$(cat ${fname}-path)
+
+    tmux send-keys -t "$session:$window.$pane" C-z "cd ${path}; cat ${fname}" Enter
+  done < $DEST_DIR/${HOST}-${session}-panes
+
+done
+
+tmux ls

@@ -1,0 +1,40 @@
+#!/bin/bash
+
+DEST_DIR=~/.tmux-sessions/
+HOST=$(hostname -s)
+
+mkdir -p $DEST_DIR
+
+tmux list-sessions -F "#{session_name}" | while read -r line ; do
+  session=$(echo $line | cut -d ' ' -f 1)
+  rm -f $DEST_DIR/${HOST}-${session}*
+
+  rm -f $DEST_DIR/${HOST}-${session}-panes
+  tmux list-panes -a -t $session -F "#{session_name} #{window_index} #{pane_index} #{window_layout}" | while read -r pane ; do
+    if (( $(echo $pane | cut -d ' ' -f 1) == $session )) ; then
+      echo $pane >> $DEST_DIR/${HOST}-${session}-panes
+    fi
+  done
+
+  while read line; do
+    #session=$(echo "$line" | cut -d ' ' -f 1)
+    window=$(echo "$line" | cut -d ' ' -f 2)
+    pane=$(echo "$line" | cut -d ' ' -f 3)
+    pid=$(tmux display-message -p -t $session:$window.$pane -F "#{pane_pid}")
+    fname=$DEST_DIR/${HOST}-$session:$window.$pane
+
+    tmux display-message -p -t $session:$window.$pane -F "#{pane_current_path}" > ${fname}-path
+
+    tmux capture-pane -t $session:$window.$pane -epS -100000 > ${fname}
+    #echo "PWD:" $(tmux display-message -p -t $session:$window.$pane -F "#{pane_current_path}") >> ${fname}
+    case $(uname -s) in
+      Linux*)     pstree $pid -a >> ${fname};;
+      #Linux*)     ps f -g $pid >> ${fname};;
+      Darwin*)    pstree $pid >> ${fname};;
+      *)          exit 0
+    esac
+  done < $DEST_DIR/${HOST}-${session}-panes
+
+done
+
+echo "Saved"
