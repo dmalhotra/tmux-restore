@@ -15,8 +15,9 @@ for fname in $DEST_DIR/${HOST}-*-panes ; do
   while read line; do
     session=$(echo "$line" | cut -d ' ' -f 1)
     window=$(echo "$line" | cut -d ' ' -f 2)
-    pane=$(echo "$line" | cut -d ' ' -f 3)
-    layout=$(echo "$line" | cut -d ' ' -f 4)
+    wname=$(echo "$line" | cut -d ' ' -f 3)
+    pane=$(echo "$line" | cut -d ' ' -f 4)
+    layout=$(echo "$line" | cut -d ' ' -f 5)
 
     if !(tmux has-session -t $session 2>/dev/null); then
       tmux new -d -s $session
@@ -41,13 +42,20 @@ for fname in $DEST_DIR/${HOST}-*-panes ; do
   while read line; do
     session=$(echo "$line" | cut -d ' ' -f 1)
     window=$(echo "$line" | cut -d ' ' -f 2)
-    pane=$(echo "$line" | cut -d ' ' -f 3)
-    session=${prefix}${session}
+    wname=$(echo "$line" | cut -d ' ' -f 3)
+    pane=$(echo "$line" | cut -d ' ' -f 4)
+    tmux rename-window -t $session:$window ${wname}
 
     fname=$DEST_DIR/${HOST}-$session:$window.${pane}
     path=$(cat ${fname}-path)
 
-    tmux send-keys -t "$session:$window.$pane" C-z "cd ${path}; cat ${fname}" Enter
+    tmux send-keys -t "$session:$window.$pane" C-z "cd ${path}; cat ${fname} ${fname}-cmd" Enter
+
+    if (grep "vim" ${fname}-cmd &>/dev/null); then
+      vimargs=$(grep 'vim' ${fname}-cmd | tail -n 1 | awk -F'vim' '{print $2}')
+      tmux send-keys -t "$session:$window.$pane" "clear; vim ${vimargs}" Enter
+    fi
+
   done < $DEST_DIR/${HOST}-${session}-panes
 
 done
