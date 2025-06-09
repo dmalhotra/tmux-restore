@@ -1,9 +1,40 @@
 #!/bin/bash
 
+if ! tmux ls > /dev/null 2>&1; then exit; fi
+
+editors="vim|vi|nvim|emacs"
 DEST_DIR=~/.tmux-sessions/
 HOST=$(hostname -s)
 
 mkdir -p $DEST_DIR
+
+detect_editor_cmd() {
+    root_pid="$1"
+
+    # Get all descendant PIDs of the root_pid
+    get_descendants() {
+        local parent=$1
+        local children=$(ps -eo pid=,ppid= | awk -v p="$parent" '$2==p {print $1}')
+        for pid in $children; do
+            echo "$pid"
+            get_descendants "$pid"
+        done
+    }
+
+    # Include the root pid itself
+    all_pids="$root_pid $(get_descendants "$root_pid")"
+
+    for pid in $all_pids; do
+        # Get the full command for each PID
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+        if [[ "$cmd" =~ (^|[[:space:]])($editors)([[:space:]]|$) ]]; then
+            echo "$cmd"
+            return 0
+        fi
+    done
+
+    return 1  # No editor found
+}
 
 tmux list-sessions -F "#{session_name}" | while read -r line ; do
   session=$(echo $line | cut -d ' ' -f 1)
@@ -28,6 +59,7 @@ tmux list-sessions -F "#{session_name}" | while read -r line ; do
 
     tmux capture-pane -t $session:$window.$pane -epS -100000 > ${fname}
     #echo "PWD:" $(tmux display-message -p -t $session:$window.$pane -F "#{pane_current_path}") >> ${fname}
+    detect_editor_cmd $pid >> ${fname}-cmd
     case $(uname -s) in
       Linux*)     pstree $pid -a >> ${fname}-cmd;;
       #Linux*)     ps f -g $pid >> ${fname}-cmd;;
