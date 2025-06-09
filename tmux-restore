@@ -1,5 +1,6 @@
 #!/bin/bash
 
+editors="vim|vi|nvim|emacs"
 DEST_DIR=~/.tmux-sessions/
 HOST=$(hostname -s)
 
@@ -51,9 +52,9 @@ for fname in $DEST_DIR/${HOST}-*-panes ; do
 
     tmux send-keys -t "$session:$window.$pane" C-z "cd ${path}; cat ${fname} ${fname}-cmd" Enter
 
-    if (grep "vim" ${fname}-cmd &>/dev/null); then
-      vimargs=$(grep 'vim' ${fname}-cmd | tail -n 1 | awk -F'vim' '{print $2}')
-      tmux send-keys -t "$session:$window.$pane" "clear; vim ${vimargs}" Enter
+    cmd=$(cat ${fname}-cmd | head -n 1)
+    if [[ "$cmd" =~ (^|[[:space:]])($editors)([[:space:]]|$) ]]; then
+      tmux send-keys -t "$session:$window.$pane" "clear; ${cmd}" Enter
     fi
 
   done < $DEST_DIR/${HOST}-${session}-panes
