@@ -1,64 +1,78 @@
 #!/bin/bash
+# tmux-restore — recreate the sessions saved by tmux-save: windows, panes,
+# layout, working directory, previous scrollback, and re-launch the editor
+# that was running in each pane.
+#
+# bash 3.2 compatible.  Reads the TAB-delimited snapshot written by tmux-save.
+
+set -uo pipefail
+shopt -s nullglob
 
 editors="vim|vi|nvim|emacs"
-DEST_DIR=~/.tmux-sessions/
-HOST=$(hostname -s)
+DEST_DIR="${HOME}/.tmux-sessions"
+HOST="$(hostname -s)"
+TAB=$'\t'
 
-for fname in $DEST_DIR/${HOST}-*-panes ; do
-  session=$(head -n 1 $fname | cut -d ' ' -f 1)
+# real existence tests (has-session only checks the SESSION, not windows/panes)
+window_exists() { tmux list-windows -t "=$1"   -F '#{window_index}' 2>/dev/null | grep -Fxq -- "$2"; }
+pane_exists()   { tmux list-panes   -t "=$1:$2" -F '#{pane_index}'   2>/dev/null | grep -Fxq -- "$3"; }
 
-  if (tmux has-session -t $session 2>/dev/null); then
-    #tmux kill-session -t $session
-    continue;
-  fi
+panes_files=("$DEST_DIR/${HOST}-"*-panes)
+[ "${#panes_files[@]}" -gt 0 ] || { echo "No saved sessions for $HOST."; exit 0; }
 
-  echo "Restoring session ${session}"
-  while read line; do
-    session=$(echo "$line" | cut -d ' ' -f 1)
-    window=$(echo "$line" | cut -d ' ' -f 2)
-    wname=$(echo "$line" | cut -d ' ' -f 3)
-    pane=$(echo "$line" | cut -d ' ' -f 4)
-    layout=$(echo "$line" | cut -d ' ' -f 5)
+for pf in "${panes_files[@]}"; do
+    [ -f "$pf" ] || continue
+    session="$(head -n1 "$pf" | cut -d"$TAB" -f1)"
+    [ -n "$session" ] || continue
 
-    if !(tmux has-session -t $session 2>/dev/null); then
-      tmux new -d -s $session
-      if (( $window != 1 )); then
-        tmux move-window -d -s ${session}:1 -t ${session}:${window}
-      fi
+    if tmux has-session -t "=$session" 2>/dev/null; then
+        continue                          # already running -> leave it alone
     fi
+    echo "Restoring session $session"
 
-    if !(tmux has-session -t $session:$window 2>/dev/null); then
-      tmux new-window -t $session:$window
-    fi
+    # Pass 1: build the windows and panes
+    while IFS="$TAB" read -r s window wname pane layout; do
+        [ -n "$s" ] || continue
+        if ! tmux has-session -t "=$s" 2>/dev/null; then
+            tmux new-session -d -s "$s" -n "$wname"
+            first="$(tmux list-windows -t "=$s" -F '#{window_index}' 2>/dev/null | head -n1)"
+            if [ -n "$first" ] && [ "$first" != "$window" ]; then
+                tmux move-window -d -s "=$s:$first" -t "=$s:$window" 2>/dev/null
+            fi
+        elif ! window_exists "$s" "$window"; then
+            tmux new-window -d -t "=$s:$window" -n "$wname" 2>/dev/null
+        fi
+        if ! pane_exists "$s" "$window" "$pane"; then
+            tmux split-window -d -t "=$s:$window" 2>/dev/null
+        fi
+    done < "$pf"
 
-    if !(tmux has-session -t $session:$window.$pane 2>/dev/null); then
-      tmux splitw -t $session:$window.0
-    fi
+    # apply each window's saved layout once
+    while IFS= read -r w; do
+        [ -n "$w" ] || continue
+        wlayout="$(awk -F"$TAB" -v win="$w" '$2==win{print $5; exit}' "$pf")"
+        [ -n "$wlayout" ] && tmux select-layout -t "=$session:$w" "$wlayout" 2>/dev/null
+    done < <(tmux list-windows -t "=$session" -F '#{window_index}' 2>/dev/null)
 
-    if (tmux has-session -t $session:$window 2>/dev/null); then
-      tmux select-layout -t $session:$window ${layout}
-    fi
-  done < $DEST_DIR/${HOST}-${session}-panes
-
-  while read line; do
-    session=$(echo "$line" | cut -d ' ' -f 1)
-    window=$(echo "$line" | cut -d ' ' -f 2)
-    wname=$(echo "$line" | cut -d ' ' -f 3)
-    pane=$(echo "$line" | cut -d ' ' -f 4)
-    tmux rename-window -t $session:$window ${wname}
-
-    fname=$DEST_DIR/${HOST}-$session:$window.${pane}
-    path=$(cat ${fname}-path)
-
-    tmux send-keys -t "$session:$window.$pane" C-z "cd ${path}; cat ${fname} ${fname}-cmd" Enter
-
-    cmd=$(cat ${fname}-cmd | head -n 1)
-    if [[ "$cmd" =~ (^|[[:space:]])($editors)([[:space:]]|$) ]]; then
-      tmux send-keys -t "$session:$window.$pane" "clear; ${cmd}" Enter
-    fi
-
-  done < $DEST_DIR/${HOST}-${session}-panes
-
+    # Pass 2: names, cwd, previous content, re-launch editor
+    while IFS="$TAB" read -r s window wname pane layout; do
+        [ -n "$s" ] || continue
+        tmux rename-window -t "=$s:$window" "$wname" 2>/dev/null
+        pane_exists "$s" "$window" "$pane" || continue
+        base="$DEST_DIR/${HOST}-$s:$window.$pane"
+        path=""
+        [ -f "${base}-path" ] && path="$(cat "${base}-path")"
+        qp="$(printf '%q' "${path:-$HOME}")"
+        qb="$(printf '%q' "$base")"
+        # suspend anything running, cd to the saved dir, redisplay previous content
+        tmux send-keys -t "=$s:$window.$pane" C-z " cd $qp; cat $qb ${qb}-cmd 2>/dev/null" Enter
+        if [ -f "${base}-cmd" ]; then
+            cmd="$(head -n1 "${base}-cmd")"
+            if [[ "$cmd" =~ (^|[[:space:]])($editors)([[:space:]]|$) ]]; then
+                tmux send-keys -t "=$s:$window.$pane" "clear; ${cmd}" Enter
+            fi
+        fi
+    done < "$pf"
 done
 
 tmux ls
