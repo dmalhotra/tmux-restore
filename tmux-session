@@ -1,0 +1,837 @@
+#!/bin/bash
+# tmux-session — save, list, attach and resurrect tmux sessions from one command.
+#
+# Usage:
+#   tmux-session                        full-screen picker on a terminal, otherwise `list`
+#   tmux-session menu                   the same picker as a plain numbered prompt
+#   tmux-session list [-a]              list sessions as YYYY-MM-DD--HH:MM--NAME (-a: every host)
+#   tmux-session new [NAME]             create a session (tracked from birth) and attach to it
+#   tmux-session attach [TARGET]        attach/switch to a running session
+#   tmux-session resurrect TARGET [-n NAME] [-d]
+#                                       rebuild an inactive session from its snapshot, then attach
+#   tmux-session save | -s [-f] [-v]    snapshot every running session; meant for cron
+#   tmux-session rm TARGET              delete an inactive session's snapshot
+#
+# TARGET is an id (20260920-133153-3), a label (2026-09-20--13:31--NAME), a session
+# name, or a unique prefix of an id or label.
+#
+# Environment:
+#   TMUX_SESSION_DIR      snapshot root                      (default ~/.tmux-sessions)
+#   TMUX_SESSION_HISTORY  scrollback lines kept per pane     (default 100000)
+#   TMUX_SESSION_CMDS     programs relaunched on resurrect, as regex alternatives
+#                                                            (default vim|vi|nvim|emacs)
+#   TMUX_SESSION_SOCKET   tmux -L socket name; used by the test-suite
+#
+# A snapshot lives in $TMUX_SESSION_DIR/<host>/<id>/ :
+#   meta       key=value lines: format id host name created saved windows panes
+#   windows    TAB: index active zoomed width height automatic-rename layout name
+#   panes      TAB: window pane active cwd          ("-" = unknown cwd)
+#   W.P.hist   scrollback from capture-pane -epJ    (colours kept, wrapped lines joined)
+#   W.P.cmd    shell-quoted command line to relaunch in that pane
+#
+# Identity: every live session carries "<host>/<id>" in the user option @tmux-session-id.
+# The id is derived from the session's creation time, so a session keeps its date across
+# renames, server restarts and resurrections, and unnamed sessions ("0", "1") are tracked
+# too.  Saves never delete anything: a snapshot whose session is gone lists as inactive.
+#
+# bash 3.2 compatible (macOS /bin/bash).
+
+set -uo pipefail
+shopt -s nullglob
+
+DEST_DIR="${TMUX_SESSION_DIR:-$HOME/.tmux-sessions}"
+HIST_LINES="${TMUX_SESSION_HISTORY:-100000}"
+CMDS="${TMUX_SESSION_CMDS:-vim|vi|nvim|emacs}"
+TAG_OPT="@tmux-session-id"
+TAB=$'\t'
+LOCK="$DEST_DIR/.lock"
+LOCK_WAIT="${TMUX_SESSION_LOCK_WAIT:-30}"
+
+# regexes live in variables: bash 3.2 mishandles quoted regex literals
+CMD_LOOSE="($CMDS)"
+CMD_EXACT="^($CMDS)([^[:alnum:]].*)?"'$'
+TAG_RE='^[A-Za-z0-9._-]+/[0-9]{8}-[0-9]{6}-[0-9]+$'
+NUM_RE='^[0-9]+$'
+
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/$(basename "$0")"
+HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9._-' '_')"
+[ -n "$HOST" ] || HOST=unknown
+
+TMPD="" STAGE="" LOCKED="" PSFILE="" NEWNAME="" NEWSID=""
+cleanup() {
+    tui_leave
+    [ -n "$STAGE" ]  && rm -rf "$STAGE"
+    [ -n "$LOCKED" ] && rm -rf "$LOCK"
+    [ -n "$TMPD" ]   && rm -rf "$TMPD"
+}
+trap cleanup EXIT
+
+die()  { printf 'tmux-session: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'tmux-session: %s\n' "$*" >&2; }
+tmux() { command tmux ${TMUX_SESSION_SOCKET:+-L "$TMUX_SESSION_SOCKET"} "$@"; }
+tmux_alive() { tmux list-sessions >/dev/null 2>&1; }
+in_tmux() { [ -n "${TMUX:-}" ]; }
+
+tmpd() {
+    [ -n "$TMPD" ] && return
+    TMPD="$(mktemp -d "${TMPDIR:-/tmp}/tmux-session.XXXXXX")" || die "mktemp failed"
+}
+ensure_dirs() {
+    mkdir -p "$DEST_DIR" || die "cannot create $DEST_DIR"
+    chmod 700 "$DEST_DIR" 2>/dev/null
+}
+fmt_epoch() {   # EPOCH STRFTIME-FORMAT   (GNU and BSD date)
+    case "$1" in ''|*[!0-9]*) printf '?'; return ;; esac
+    date -d "@$1" "+$2" 2>/dev/null || date -r "$1" "+$2" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- locking
+lock_acquire() {   # SECONDS-TO-WAIT
+    local waited=0 pid
+    ensure_dirs
+    until mkdir "$LOCK" 2>/dev/null; do
+        pid="$(cat "$LOCK/pid" 2>/dev/null)"
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$LOCK"; continue             # stale lock from a dead process
+        fi
+        [ "$waited" -ge "$1" ] && return 1
+        sleep 1; waited=$((waited + 1))
+    done
+    echo $$ > "$LOCK/pid"; LOCKED=1
+}
+lock_release() { [ -n "$LOCKED" ] && rm -rf "$LOCK"; LOCKED=""; }
+
+# ---------------------------------------------------------------- identity
+valid_tag() { [[ "$1" =~ $TAG_RE ]]; }
+make_tag()  { printf '%s/%s-%s\n' "$HOST" "$(fmt_epoch "$2" '%Y%m%d-%H%M%S')" "${1#\$}"; }   # SID CREATED
+ensure_tag() {   # SID CREATED CURRENT-TAG(or -)  -> prints the tag, adopting the session if needed
+    local tag="$3"
+    if [ "$tag" = "-" ] || ! valid_tag "$tag"; then
+        tag="$(make_tag "$1" "$2")"
+        valid_tag "$tag" || die "cannot build an id for session $1"
+        tmux set-option -t "$1" "$TAG_OPT" "$tag" 2>/dev/null
+    fi
+    printf '%s\n' "$tag"
+}
+meta_get() {   # FILE KEY
+    local line
+    while IFS= read -r line; do
+        case "$line" in "$2="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+    done < "$1"
+    return 1
+}
+entry_label() { printf '%s--%s\n' "$(fmt_epoch "$1" '%Y-%m-%d--%H:%M')" "$2"; }   # CREATED NAME
+
+# sid created activity windows attached tag name   (tag is "-" when untagged)
+live_sessions() {
+    tmux list-sessions -F "#{session_id}${TAB}#{session_created}${TAB}#{session_activity}${TAB}#{session_windows}${TAB}#{session_attached}${TAB}#{?${TAG_OPT},#{${TAG_OPT}},-}${TAB}#{session_name}" 2>/dev/null
+}
+
+# Merged view of live sessions and snapshots, sorted by creation time.
+# created tag state sid windows panes attached saved name    state: active|unsaved|inactive
+build_entries() {   # [all]
+    tmpd
+    local live="$TMPD/live" out="$TMPD/entries.raw"
+    local sid created activity nwin attached tag name npanes saved state mf orig
+    : > "$live"; : > "$out"
+    while IFS="$TAB" read -r sid created activity nwin attached tag name; do
+        [ -n "$sid" ] || continue
+        tag="$(ensure_tag "$sid" "$created" "$tag")"
+        printf '%s\n' "$tag" >> "$live"
+        npanes="$(tmux list-panes -s -t "$sid" 2>/dev/null | wc -l | tr -d ' ')"
+        if [ -f "$DEST_DIR/$tag/meta" ]; then
+            state=active
+            saved="$(meta_get "$DEST_DIR/$tag/meta" saved)"
+            orig="$(meta_get "$DEST_DIR/$tag/meta" created)"; [ -n "$orig" ] && created="$orig"
+        else
+            state=unsaved; saved="-"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$created" "$tag" "$state" "$sid" "$nwin" "$npanes" "$attached" "${saved:--}" "$name" >> "$out"
+    done < <(live_sessions)
+    for mf in "$DEST_DIR"/*/*/meta; do
+        tag="${mf#"$DEST_DIR"/}"; tag="${tag%/meta}"
+        valid_tag "$tag" || continue
+        [ "${1:-}" = all ] || [ "${tag%%/*}" = "$HOST" ] || continue
+        grep -Fxq -- "$tag" "$live" && continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(meta_get "$mf" created)" "$tag" inactive - "$(meta_get "$mf" windows)" \
+            "$(meta_get "$mf" panes)" 0 "$(meta_get "$mf" saved)" "$(meta_get "$mf" name)" >> "$out"
+    done
+    sort -t "$TAB" -k1,1n -k2,2 "$out"
+}
+
+print_entries() {   # ENTRIES-FILE
+    local n=0 w=1 created tag state sid nwin npanes attached saved name label st extra
+    while IFS="$TAB" read -r created tag state sid nwin npanes attached saved name; do
+        label="$(entry_label "$created" "$name")"
+        [ ${#label} -gt $w ] && w=${#label}
+    done < "$1"
+    while IFS="$TAB" read -r created tag state sid nwin npanes attached saved name; do
+        n=$((n + 1))
+        label="$(entry_label "$created" "$name")"
+        case "$state" in
+            inactive) st=inactive; extra="saved $(fmt_epoch "$saved" '%Y-%m-%d %H:%M')" ;;
+            unsaved)  st=active;   extra="not yet saved" ;;
+            *)        st=active;   extra=""; [ "${attached:-0}" != 0 ] && extra="attached" ;;
+        esac
+        [ "${tag%%/*}" = "$HOST" ] || extra="$extra [${tag%%/*}]"
+        printf "%3d) %-${w}s  %-8s  %-7s  %s\n" "$n" "$label" "$st" "${nwin}w/${npanes}p" "$extra"
+    done < "$1"
+}
+
+resolve_target() {   # TARGET [live|inactive] -> prints the one matching entry line
+    local t="$1" line created tag state sid nwin npanes attached saved name id label n
+    tmpd
+    build_entries all > "$TMPD/all"
+    : > "$TMPD/exact"; : > "$TMPD/prefix"
+    while IFS= read -r line; do
+        IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+        id="${tag#*/}"; label="$(entry_label "$created" "$name")"
+        if [ "$t" = "$tag" ] || [ "$t" = "$id" ] || [ "$t" = "$label" ] || [ "$t" = "$name" ]; then
+            printf '%s\n' "$line" >> "$TMPD/exact"
+        elif [ "${id#"$t"}" != "$id" ] || [ "${label#"$t"}" != "$label" ]; then
+            printf '%s\n' "$line" >> "$TMPD/prefix"
+        fi
+    done < "$TMPD/all"
+    [ -s "$TMPD/exact" ] || cp "$TMPD/prefix" "$TMPD/exact"
+    n="$(wc -l < "$TMPD/exact" | tr -d ' ')"
+    if [ "$n" -gt 1 ] && [ -n "${2:-}" ]; then      # e.g. an old and a new session both named "0"
+        case "$2" in
+            live)     grep -v "${TAB}inactive${TAB}" "$TMPD/exact" > "$TMPD/pref" ;;
+            inactive) grep    "${TAB}inactive${TAB}" "$TMPD/exact" > "$TMPD/pref" ;;
+        esac
+        if [ "$(wc -l < "$TMPD/pref" | tr -d ' ')" -eq 1 ]; then
+            mv "$TMPD/pref" "$TMPD/exact"; n=1
+        fi
+    fi
+    case "$n" in
+        0) die "no session matches '$t'" ;;
+        1) cat "$TMPD/exact" ;;
+        *) warn "'$t' is ambiguous:"; print_entries "$TMPD/exact" >&2; exit 1 ;;
+    esac
+}
+
+attach_sid() {   # SESSION-ID
+    if in_tmux; then
+        tmux switch-client -t "$1"
+    elif [ -t 0 ] && [ -t 1 ]; then
+        tmux attach-session -t "$1"
+    else
+        echo "not on a terminal; attach with: tmux attach-session -t '$1'"
+    fi
+}
+
+# ---------------------------------------------------------------- save
+descendants() {   # ROOT-PID -> "pid<TAB>comm" lines, root first, breadth-first
+    awk -v root="$1" '
+        { pid = $1; ppid = $2; $1 = ""; $2 = ""; sub(/^ +/, "")
+          comm[pid] = $0; kids[ppid] = kids[ppid] " " pid }
+        END {
+            n = 0; q[n++] = root
+            for (i = 0; i < n && n < 10000; i++) {
+                p = q[i]; print p "\t" comm[p]
+                c = split(kids[p], k, " "); for (j = 1; j <= c; j++) q[n++] = k[j]
+            }
+        }' "$PSFILE"
+}
+argv_quoted() {   # PID -> shell-quoted command line (exact on Linux via /proc, ps elsewhere)
+    local a out=""
+    if [ -r "/proc/$1/cmdline" ]; then
+        while IFS= read -r -d '' a; do out="$out$(printf '%q' "$a") "; done < "/proc/$1/cmdline"
+        [ -n "$out" ] || return 1
+        printf '%s\n' "${out% }"
+    else
+        ps -p "$1" -o command= 2>/dev/null | sed 's/^ *//' | grep .
+    fi
+}
+detect_cmd() {   # PANE-PID -> relaunch command for the first matching process in the pane
+    local pid comm line argv0
+    while IFS="$TAB" read -r pid comm; do
+        [[ "${comm##*/}" =~ $CMD_LOOSE ]] || continue
+        line="$(argv_quoted "$pid")" || continue
+        argv0="${line%% *}"; argv0="${argv0##*/}"
+        [[ "$argv0" =~ $CMD_EXACT ]] || continue
+        printf '%s\n' "$line"; return 0
+    done < <(descendants "$1")
+    return 1
+}
+
+save_session() {   # SID TAG NAME CREATED NOW
+    local sid="$1" tag="$2" name="$3" created="$4" now="$5"
+    local dir="$DEST_DIR/$tag" sdir="$STAGE/${tag##*/}"
+    local wid widx wactive wzoom ww wh wauto wlayout wname pane_id pidx pactive ppid cwd cmd nwin npanes
+    rm -rf "$sdir"; mkdir -p "$sdir" || return 1
+    tmux list-windows -t "$sid" -F "#{window_id}${TAB}#{window_index}${TAB}#{window_active}${TAB}#{window_zoomed_flag}${TAB}#{window_width}${TAB}#{window_height}${TAB}#{automatic-rename}${TAB}#{window_layout}${TAB}#{window_name}" \
+        > "$sdir/windows.raw" 2>/dev/null || return 1
+    : > "$sdir/windows"; : > "$sdir/panes"
+    while IFS="$TAB" read -r wid widx wactive wzoom ww wh wauto wlayout wname; do
+        [ -n "$wid" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$widx" "$wactive" "$wzoom" "$ww" "$wh" "$wauto" "$wlayout" "$wname" >> "$sdir/windows"
+        while IFS="$TAB" read -r pane_id pidx pactive ppid cwd; do
+            [ -n "$pane_id" ] || continue
+            printf '%s\t%s\t%s\t%s\n' "$widx" "$pidx" "$pactive" "${cwd:--}" >> "$sdir/panes"
+            tmux capture-pane -epJ -S "-$HIST_LINES" -t "$pane_id" > "$sdir/$widx.$pidx.hist" 2>/dev/null
+            if cmd="$(detect_cmd "$ppid")" && [ -n "$cmd" ]; then
+                printf '%s\n' "$cmd" > "$sdir/$widx.$pidx.cmd"
+            fi
+        done < <(tmux list-panes -t "$wid" -F "#{pane_id}${TAB}#{pane_index}${TAB}#{pane_active}${TAB}#{pane_pid}${TAB}#{pane_current_path}" 2>/dev/null)
+    done < "$sdir/windows.raw"
+    rm -f "$sdir/windows.raw"
+    nwin="$(wc -l < "$sdir/windows" | tr -d ' ')"; npanes="$(wc -l < "$sdir/panes" | tr -d ' ')"
+    [ "$nwin" -gt 0 ] || return 1
+    printf 'format=1\nid=%s\nhost=%s\nname=%s\ncreated=%s\nsaved=%s\nwindows=%s\npanes=%s\n' \
+        "${tag##*/}" "${tag%%/*}" "$name" "$created" "$now" "$nwin" "$npanes" > "$sdir/meta"
+    # swap the finished snapshot into place; the previous one survives any failure
+    mkdir -p "${dir%/*}" || return 1
+    chmod 700 "${dir%/*}" 2>/dev/null
+    rm -rf "$dir.old"
+    if [ -d "$dir" ]; then mv "$dir" "$dir.old" || return 1; fi
+    if mv "$sdir" "$dir"; then
+        rm -rf "$dir.old"
+    else
+        [ -d "$dir.old" ] && mv "$dir.old" "$dir"; return 1
+    fi
+}
+
+cmd_save() {
+    local force="" verbose="" a now sid created activity nwin attached tag name dir orig
+    local old_saved old_name old_win nsaved=0 nskip=0
+    for a in "$@"; do
+        case "$a" in
+            -f|--force) force=1 ;;
+            -v|--verbose) verbose=1 ;;
+            *) die "save: unknown option '$a'" ;;
+        esac
+    done
+    [ -t 1 ] && verbose=1
+    tmux_alive || exit 0
+    umask 077                       # snapshots hold scrollback; keep them private to the user
+    ensure_dirs
+    lock_acquire "$LOCK_WAIT" || { [ -n "$verbose" ] && warn "another tmux-session holds the lock; skipped"; exit 0; }
+    STAGE="$(mktemp -d "$DEST_DIR/.stage.XXXXXX")" || die "mktemp failed"
+    PSFILE="$STAGE/ps"; ps -eo pid=,ppid=,comm= > "$PSFILE" 2>/dev/null || : > "$PSFILE"
+    now="$(date +%s)"
+    while IFS="$TAB" read -r sid created activity nwin attached tag name; do
+        [ -n "$sid" ] || continue
+        tag="$(ensure_tag "$sid" "$created" "$tag")"
+        dir="$DEST_DIR/$tag"; orig="$created"
+        if [ -f "$dir/meta" ]; then
+            old_saved="$(meta_get "$dir/meta" saved)"; old_name="$(meta_get "$dir/meta" name)"
+            old_win="$(meta_get "$dir/meta" windows)"; orig="$(meta_get "$dir/meta" created)"
+            [ -n "$orig" ] || orig="$created"
+            if [ -z "$force" ] && [ "$activity" -lt "${old_saved:-0}" ] 2>/dev/null \
+               && [ "$name" = "$old_name" ] && [ "$nwin" = "$old_win" ]; then
+                nskip=$((nskip + 1))
+                [ -n "$verbose" ] && echo "unchanged  $(entry_label "$orig" "$name")"
+                continue
+            fi
+        fi
+        if save_session "$sid" "$tag" "$name" "$orig" "$now"; then
+            nsaved=$((nsaved + 1))
+            [ -n "$verbose" ] && echo "saved      $(entry_label "$orig" "$name")"
+        else
+            warn "failed to save session '$name'"
+        fi
+    done < <(live_sessions)
+    [ -n "$verbose" ] && echo "$nsaved saved, $nskip unchanged"
+    rm -rf "$STAGE"; STAGE=""          # explicit: the TUI runs this in a subshell, without the trap
+    lock_release
+}
+
+# ---------------------------------------------------------------- resurrect
+replay_cmd() {   # DIR WINDOW PANE -> the shell command a rebuilt pane runs
+    printf '%q _replay %q %s %s || exec "$SHELL" -l' "$SELF" "$1" "$2" "$3"
+}
+resume_job() {   # re-run the stopped foreground job until it exits.  Recursion rather than a loop:
+    local rc     # bash abandons every enclosing loop when a foreground job stops, and `fg`
+    fg %+; rc=$? # fails outright when its output is redirected, so neither is used here.
+    case "$rc" in 147|148|149|150) resume_job ;; esac
+}
+cmd_replay() {   # DIR WINDOW PANE   (runs inside the rebuilt pane)
+    local hist="$1/$2.$3.hist" cmdf="$1/$2.$3.cmd" cmd ds dc rc
+    if [ -f "$hist" ]; then cat -- "$hist"; printf '\033[0m'; fi
+    if [ -s "$cmdf" ]; then
+        IFS= read -r cmd < "$cmdf"
+        set -m                        # own process group, so ^C/^Z reach the editor and not us
+        eval "$cmd"; rc=$?
+        case "$rc" in 147|148|149|150) resume_job ;; esac   # stopped by ^Z: resume, don't freeze
+        set +m
+    fi
+    ds="$(tmux show-option -gqv default-shell 2>/dev/null)"; ds="${ds:-${SHELL:-/bin/sh}}"
+    dc="$(tmux show-option -gqv default-command 2>/dev/null)"
+    if [ -n "$dc" ]; then exec "$ds" -c "$dc"; fi     # tmux's own rule for default-command
+    exec -a "-${ds##*/}" "$ds"                        # login shell, named as tmux would name it
+}
+
+resurrect_snapshot() {   # TAG NAME   -> sets NEWNAME / NEWSID to the session actually created
+    local tag="$1" name="$2" dir="$DEST_DIR/$1" i=2 sid="" awin="" nth apane
+    local widx wactive wzoom ww wh wauto wlayout wname _w pidx pactive cwd cmd fidx last
+    local nargs
+    [ -f "$dir/windows" ] && [ -f "$dir/panes" ] || die "snapshot $tag is incomplete"
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        while tmux has-session -t "=$name-$i" 2>/dev/null; do i=$((i + 1)); done
+        echo "session '$name' is running; resurrecting as '$name-$i'"
+        name="$name-$i"
+    fi
+    # every target below uses the session id ($N): exact, and accepted by every tmux command
+    while IFS="$TAB" read -r widx wactive wzoom ww wh wauto wlayout wname; do
+        [ -n "$widx" ] || continue
+        nth=0; apane=""
+        nargs=(); [ -n "$wname" ] && nargs=(-n "$wname")
+        while IFS="$TAB" read -r _w pidx pactive cwd; do
+            [ -n "$pidx" ] || continue
+            if [ "$cwd" = "-" ] || [ ! -d "$cwd" ]; then cwd="$HOME"; fi
+            [ "$pactive" = 1 ] && apane="$pidx"
+            cmd="$(replay_cmd "$dir" "$widx" "$pidx")"
+            nth=$((nth + 1))
+            if [ "$nth" -eq 1 ] && [ -z "$sid" ]; then
+                sid="$(tmux new-session -d -P -F '#{session_id}' -s "$name" ${nargs[@]+"${nargs[@]}"} \
+                    -x "${ww:-200}" -y "${wh:-50}" -c "$cwd" "$cmd")"
+                [ -n "$sid" ] || die "cannot create session '$name'"
+                fidx="$(tmux list-windows -t "$sid" -F '#{window_index}' 2>/dev/null | head -n1)"
+                [ "$fidx" = "$widx" ] || tmux move-window -d -s "$sid:$fidx" -t "$sid:$widx"
+            elif [ "$nth" -eq 1 ]; then
+                tmux new-window -d -t "$sid:$widx" ${nargs[@]+"${nargs[@]}"} -c "$cwd" "$cmd" \
+                    || warn "cannot create window $widx"
+            else
+                last="$(tmux list-panes -t "$sid:$widx" -F '#{pane_index}' 2>/dev/null | tail -n1)"
+                if ! tmux split-window -d -t "$sid:$widx.$last" -c "$cwd" "$cmd" 2>/dev/null; then
+                    tmux select-layout -t "$sid:$widx" tiled 2>/dev/null       # make room, then retry
+                    tmux split-window -d -t "$sid:$widx.$last" -c "$cwd" "$cmd" \
+                        || warn "cannot create pane $widx.$pidx"
+                fi
+            fi
+        done < <(awk -F "$TAB" -v w="$widx" '$1 == w' "$dir/panes")
+        [ -n "$sid" ] || continue
+        tmux select-layout -t "$sid:$widx" "$wlayout" 2>/dev/null \
+            || tmux select-layout -t "$sid:$widx" tiled 2>/dev/null
+        case "$wauto" in on|1) tmux set-option -w -u -t "$sid:$widx" automatic-rename 2>/dev/null ;; esac
+        [ -n "$apane" ]    && tmux select-pane -t "$sid:$widx.$apane" 2>/dev/null
+        [ "$wzoom" = 1 ]   && tmux resize-pane -Z -t "$sid:$widx.${apane:-0}" 2>/dev/null
+        [ "$wactive" = 1 ] && awin="$widx"
+    done < "$dir/windows"
+    [ -n "$sid" ] || die "snapshot $tag has no windows"
+    [ -n "$awin" ] && tmux select-window -t "$sid:$awin" 2>/dev/null
+    tmux set-option -t "$sid" "$TAG_OPT" "$tag" \
+        || warn "could not tag session '$name'; the next save will record it as a new entry"
+    NEWNAME="$name"; NEWSID="$sid"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_list() {
+    local all="" a
+    for a in "$@"; do
+        case "$a" in -a|--all) all=all ;; *) die "list: unknown option '$a'" ;; esac
+    done
+    tmpd
+    build_entries "$all" > "$TMPD/entries"
+    if [ -s "$TMPD/entries" ]; then print_entries "$TMPD/entries"; else echo "No sessions."; fi
+}
+
+cmd_new() {
+    local name="${1:-}" sid created
+    if [ -n "$name" ]; then
+        sid="$(tmux new-session -d -P -F '#{session_id}' -s "$name")"
+    else
+        sid="$(tmux new-session -d -P -F '#{session_id}')"
+    fi
+    [ -n "$sid" ] || die "cannot create session${name:+ '$name'}"
+    created="$(tmux display-message -p -t "$sid" '#{session_created}')"
+    ensure_tag "$sid" "$created" - > /dev/null
+    attach_sid "$sid"
+}
+
+cmd_attach() {
+    local target="${1:-}" line created tag state sid nwin npanes attached saved name n
+    tmpd
+    if [ -z "$target" ]; then
+        build_entries > "$TMPD/entries"
+        grep -v "${TAB}inactive${TAB}" "$TMPD/entries" > "$TMPD/live.entries"
+        n="$(wc -l < "$TMPD/live.entries" | tr -d ' ')"
+        [ "$n" -eq 1 ] || { print_entries "$TMPD/entries"; die "attach: which session?"; }
+        line="$(cat "$TMPD/live.entries")"
+    else
+        line="$(resolve_target "$target" live)" || exit 1
+    fi
+    IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+    [ "$state" != inactive ] || die "session '$name' is not running; use: tmux-session resurrect '$target'"
+    attach_sid "$sid"
+}
+
+cmd_resurrect() {
+    local target="" newname="" detach="" line created tag state sid nwin npanes attached saved name
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--name) [ $# -ge 2 ] || die "resurrect: -n needs a name"; newname="$2"; shift ;;
+            -d|--detach) detach=1 ;;
+            -*) die "resurrect: unknown option '$1'" ;;
+            *) target="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$target" ] || die "resurrect: TARGET required"
+    line="$(resolve_target "$target" inactive)" || exit 1
+    IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+    if [ "$state" != inactive ]; then
+        echo "session '$name' is already running"
+        [ -n "$detach" ] || attach_sid "$sid"
+        return 0
+    fi
+    lock_acquire "$LOCK_WAIT" || die "another tmux-session is saving; try again"
+    resurrect_snapshot "$tag" "${newname:-$name}"
+    lock_release
+    echo "resurrected $(entry_label "$created" "$name") as '$NEWNAME'"
+    [ -n "$detach" ] || attach_sid "$NEWSID"
+}
+
+cmd_rm() {
+    local line created tag state sid nwin npanes attached saved name
+    [ -n "${1:-}" ] || die "rm: TARGET required"
+    line="$(resolve_target "$1" inactive)" || exit 1
+    IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+    [ "$state" = inactive ] || die "session '$name' is running; kill it before deleting its snapshot"
+    rm -rf "$DEST_DIR/$tag" && echo "deleted $(entry_label "$created" "$name")"
+}
+
+cmd_menu() {
+    local ans n line created tag state sid nwin npanes attached saved name choice arg yn
+    tmpd
+    while :; do
+        build_entries > "$TMPD/menu"
+        n="$(wc -l < "$TMPD/menu" | tr -d ' ')"
+        echo
+        if [ "$n" -eq 0 ]; then echo "No sessions."; else print_entries "$TMPD/menu"; fi
+        printf '\n[1-%s] attach/resurrect   n [NAME] new   d N delete   s save   q quit\n> ' "$n"
+        IFS= read -r ans || return 0
+        set -- $ans
+        choice="${1:-}"; arg="${2:-}"
+        case "$choice" in
+            ''|q|quit) return 0 ;;
+            s|save) cmd_save -v ;;
+            n|new) cmd_new "$arg"; in_tmux && return 0 ;;
+            d|rm|delete)
+                line="$(sed -n "${arg:-0}p" "$TMPD/menu" 2>/dev/null)"
+                [ -n "$line" ] || { echo "no entry '$arg'"; continue; }
+                IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+                [ "$state" = inactive ] || { echo "'$name' is running; kill it before deleting"; continue; }
+                printf "delete %s? [y/N] " "$(entry_label "$created" "$name")"
+                IFS= read -r yn || return 0
+                case "$yn" in y|Y) rm -rf "$DEST_DIR/$tag" && echo deleted ;; esac ;;
+            *)
+                if [[ "$choice" =~ $NUM_RE ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+                    line="$(sed -n "${choice}p" "$TMPD/menu")"
+                    IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+                    if [ "$state" = inactive ]; then
+                        lock_acquire "$LOCK_WAIT" || { echo "a save is in progress; try again"; continue; }
+                        resurrect_snapshot "$tag" "$name"
+                        lock_release
+                        sid="$NEWSID"
+                    fi
+                    attach_sid "$sid"
+                    in_tmux && return 0
+                else
+                    echo "unknown choice '$choice'"
+                fi ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- full-screen picker
+# Drawn straight onto the terminal (alternate screen, cursor keys, reverse-video cursor,
+# preview pane) with tput capabilities and CSI sequences: bash has no curses binding, and
+# this way nothing needs installing.  Falls back to the numbered menu on a dumb terminal.
+ESC="$(printf '\033')"
+TUI_ACTIVE="" TUI_STTY="" KEY="" MSG="" REPLY_="" ALL=""
+ROWS=24 COLS=80 N=0 SEL=-1 TOP=0 LW=1 LIST_ROWS=1 PV_SEL=-1 PV_TEXT="" PADDED=""
+T_REV="" T_BOLD="" T_DIM="" T_SGR0="" C_OK="" C_OLD="" C_NEW="" C_HDR=""
+
+tui_supported() {
+    [ -t 0 ] && [ -t 1 ] || return 1
+    [ -n "${TERM:-}" ] && [ "$TERM" != dumb ] || return 1
+    type -P tput > /dev/null 2>&1 || return 1
+    [ "$(tput lines 2>/dev/null || echo 0)" -ge 8 ]
+}
+tui_caps() {
+    T_REV="$(tput rev 2>/dev/null)"; T_BOLD="$(tput bold 2>/dev/null)"; T_DIM="$(tput dim 2>/dev/null)"
+    T_SGR0="$(tput sgr0 2>/dev/null)"
+    C_OK="$(tput setaf 2 2>/dev/null)"; C_OLD="$(tput setaf 3 2>/dev/null)"
+    C_NEW="$(tput setaf 6 2>/dev/null)"; C_HDR="$(tput setaf 4 2>/dev/null)"
+}
+tui_size() {
+    ROWS="$(tput lines 2>/dev/null)"; COLS="$(tput cols 2>/dev/null)"
+    case "$ROWS" in ''|*[!0-9]*) ROWS=24 ;; esac
+    case "$COLS" in ''|*[!0-9]*) COLS=80 ;; esac
+}
+tui_enter() {
+    TUI_STTY="$(stty -g 2>/dev/null)"
+    tput smcup 2>/dev/null; tput civis 2>/dev/null
+    TUI_ACTIVE=1
+}
+tui_leave() {
+    [ -n "$TUI_ACTIVE" ] || return 0
+    tput cnorm 2>/dev/null; tput rmcup 2>/dev/null
+    [ -n "$TUI_STTY" ] && stty "$TUI_STTY" 2>/dev/null
+    TUI_ACTIVE=""
+}
+tui_pad() {   # TEXT -> PADDED, cut or padded to the terminal width
+    local t="${1//$TAB/ }"
+    printf -v PADDED "%-${COLS}s" "${t:0:$COLS}"
+}
+meta_set() {   # FILE KEY VALUE
+    local tmp="$1.tmp"
+    awk -v k="$2" -v v="$3" 'index($0, k "=") == 1 { print k "=" v; done = 1; next } { print }
+                             END { if (!done) print k "=" v }' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+
+tui_refresh() {   # rebuild the entry table and the pre-rendered rows
+    local created tag state sid nwin npanes attached saved name label st extra
+    build_entries "$ALL" > "$TMPD/tui"
+    N="$(wc -l < "$TMPD/tui" | tr -d ' ')"
+    LW=23                                # width of the column header "date        time   name"
+    while IFS="$TAB" read -r created tag state sid nwin npanes attached saved name; do
+        label="$(entry_label "$created" "$name")"
+        [ ${#label} -gt "$LW" ] && LW=${#label}
+    done < "$TMPD/tui"
+    : > "$TMPD/tui.rows"
+    while IFS="$TAB" read -r created tag state sid nwin npanes attached saved name; do
+        label="$(entry_label "$created" "$name")"
+        case "$state" in
+            inactive) st=inactive; extra="saved $(fmt_epoch "$saved" '%Y-%m-%d %H:%M')" ;;
+            unsaved)  st=active;   extra="not yet saved" ;;
+            *)        st=active;   extra=""; [ "${attached:-0}" != 0 ] && extra="attached" ;;
+        esac
+        [ "${tag%%/*}" = "$HOST" ] || extra="$extra [${tag%%/*}]"
+        printf "%s\t%-${LW}s  %-8s  %-7s  %s\n" \
+            "$state" "$label" "$st" "${nwin}w/${npanes}p" "$extra" >> "$TMPD/tui.rows"
+    done < "$TMPD/tui"
+    if [ "$N" -eq 0 ]; then
+        SEL=0
+    else
+        [ "$SEL" -lt 0 ] && SEL=$((N - 1))          # start on the newest session
+        [ "$SEL" -ge "$N" ] && SEL=$((N - 1))
+    fi
+    PV_SEL=-1
+}
+
+tui_preview() {   # ENTRY-LINE -> a few lines describing that session
+    local created tag state sid nwin npanes attached saved name dir
+    local widx wactive wzoom ww wh wauto wlayout wname cnt cwd aw ap
+    IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$1"
+    dir="$DEST_DIR/$tag"
+    if [ "$state" != inactive ]; then
+        tmux list-windows -t "$sid" \
+            -F "  #{window_index}: #{window_name}  (#{window_panes} panes)  #{pane_current_path}" 2>/dev/null | head -n 6
+        echo "  active pane:"
+        tmux capture-pane -p -t "$sid" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 4 | sed 's/^/  | /'
+    elif [ -f "$dir/windows" ] && [ -f "$dir/panes" ]; then
+        while IFS="$TAB" read -r widx wactive wzoom ww wh wauto wlayout wname; do
+            [ -n "$widx" ] || continue
+            cnt="$(awk -F "$TAB" -v w="$widx" '$1 == w' "$dir/panes" | wc -l | tr -d ' ')"
+            cwd="$(awk -F "$TAB" -v w="$widx" '$1 == w && $3 == 1 { print $4; exit }' "$dir/panes")"
+            printf '  %s: %s  (%s panes)  %s\n' "$widx" "$wname" "$cnt" "$cwd"
+        done < "$dir/windows" | head -n 6
+        aw="$(awk -F "$TAB" '$2 == 1 { print $1; exit }' "$dir/windows")"
+        ap="$(awk -F "$TAB" -v w="$aw" '$1 == w && $3 == 1 { print $2; exit }' "$dir/panes")"
+        if [ -f "$dir/$aw.$ap.hist" ]; then
+            echo "  active pane:"
+            tail -n 60 "$dir/$aw.$ap.hist" | sed "s/${ESC}\[[0-9;]*m//g" \
+                | grep -v '^[[:space:]]*$' | tail -n 4 | sed 's/^/  | /'
+        fi
+    fi
+}
+
+tui_draw() {
+    local pv sep=0 i=0 frame st text shown=0 plines=0 line color
+    tui_size
+    pv=$((ROWS / 3)); [ "$pv" -gt 12 ] && pv=12
+    if [ "$pv" -lt 5 ]; then pv=0; else sep=1; fi
+    LIST_ROWS=$((ROWS - 4 - pv - sep)); [ "$LIST_ROWS" -lt 1 ] && LIST_ROWS=1
+    [ "$SEL" -lt "$TOP" ] && TOP=$SEL
+    [ "$SEL" -ge $((TOP + LIST_ROWS)) ] && TOP=$((SEL - LIST_ROWS + 1))
+    [ "$TOP" -lt 0 ] && TOP=0
+    frame="${ESC}[H"
+    text="tmux-session   host: $HOST   $N session(s)"; [ -n "$ALL" ] && text="$text   [all hosts]"
+    tui_pad "$text"; frame="$frame${T_BOLD}${C_HDR}${PADDED}${T_SGR0}${ESC}[K"$'\n'
+    # same column layout as the rows: 2-char cursor column, label, state, size, info
+    printf -v text "  %-${LW}s  %-8s  %-7s  %s" "date        time   name" "state" "size" ""
+    tui_pad "$text"; frame="$frame${T_DIM}${PADDED}${T_SGR0}${ESC}[K"$'\n'
+    if [ "$N" -eq 0 ]; then
+        tui_pad "  No sessions yet.  Press n to create one."
+        frame="$frame${PADDED}${ESC}[K"$'\n'; shown=1
+    else
+        while IFS="$TAB" read -r st text; do
+            if [ "$i" -ge "$TOP" ] && [ "$shown" -lt "$LIST_ROWS" ]; then
+                if [ "$i" -eq "$SEL" ]; then
+                    tui_pad "> $text"; frame="$frame${T_REV}${T_BOLD}${PADDED}${T_SGR0}${ESC}[K"$'\n'
+                else
+                    case "$st" in inactive) color="$C_OLD" ;; unsaved) color="$C_NEW" ;; *) color="$C_OK" ;; esac
+                    tui_pad "  $text"; frame="$frame${color}${PADDED}${T_SGR0}${ESC}[K"$'\n'
+                fi
+                shown=$((shown + 1))
+            fi
+            i=$((i + 1))
+        done < "$TMPD/tui.rows"
+    fi
+    while [ "$shown" -lt "$LIST_ROWS" ]; do frame="$frame${ESC}[K"$'\n'; shown=$((shown + 1)); done
+    if [ "$pv" -gt 0 ]; then
+        printf -v text "%${COLS}s" ''; frame="$frame${T_DIM}${text// /-}${T_SGR0}${ESC}[K"$'\n'
+        if [ "$N" -gt 0 ]; then
+            if [ "$PV_SEL" != "$SEL" ]; then
+                PV_TEXT="$(tui_preview "$(sed -n "$((SEL + 1))p" "$TMPD/tui")")"; PV_SEL=$SEL
+            fi
+            while [ "$plines" -lt "$pv" ] && IFS= read -r line; do
+                tui_pad "$line"; frame="$frame${PADDED}${ESC}[K"$'\n'; plines=$((plines + 1))
+            done <<< "$PV_TEXT"
+        fi
+        while [ "$plines" -lt "$pv" ]; do frame="$frame${ESC}[K"$'\n'; plines=$((plines + 1)); done
+    fi
+    tui_pad "  $MSG"; frame="$frame${C_NEW}${PADDED}${T_SGR0}${ESC}[K"$'\n'
+    if [ "$COLS" -ge 100 ]; then
+        tui_pad "  Up/Down move   Enter attach/resurrect   n new   r rename   d delete   s save   a all hosts   q quit"
+    else
+        tui_pad "  Up/Down  Enter attach  n new  r rename  d delete  s save  a hosts  q quit"
+    fi
+    frame="$frame${T_DIM}${PADDED}${T_SGR0}${ESC}[K"
+    printf '%s' "$frame"
+}
+
+tui_key() {   # -> KEY   (bash 3.2: read -t takes whole seconds only)
+    local k k2 k3 rc t0="$SECONDS"
+    KEY=other
+    IFS= read -rsn1 -t 5 k; rc=$?
+    if [ "$rc" -ne 0 ]; then                          # timeout -> periodic refresh;
+        if [ "$SECONDS" -eq "$t0" ]; then KEY=quit; else KEY=timeout; fi   # instant failure -> stdin gone
+        return
+    fi
+    case "$k" in
+        "$ESC")
+            IFS= read -rsn1 -t 1 k2 || { KEY=quit; return; }              # a lone Escape
+            case "$k2" in
+                '['|O)
+                    IFS= read -rsn1 -t 1 k3 || return
+                    case "$k3" in
+                        A) KEY=up ;;   B) KEY=down ;;  H) KEY=home ;;  F) KEY=end ;;
+                        1|7) KEY=home; IFS= read -rsn1 -t 1 k3 ;;             # ESC [ 1 ~
+                        4|8) KEY=end;  IFS= read -rsn1 -t 1 k3 ;;
+                        5)   KEY=pgup; IFS= read -rsn1 -t 1 k3 ;;
+                        6)   KEY=pgdn; IFS= read -rsn1 -t 1 k3 ;;
+                    esac ;;
+            esac ;;
+        '')  KEY=enter ;;
+        k|K) KEY=up ;;      j|J) KEY=down ;;
+        g)   KEY=home ;;    G)   KEY=end ;;
+        q|Q) KEY=quit ;;
+        n|N) KEY=new ;;     d|D) KEY=delete ;;   s|S) KEY=save ;;
+        r)   KEY=rename ;;  R|$'\f') KEY=refresh ;;
+        a|A) KEY=all ;;
+    esac
+}
+tui_prompt() {   # PROMPT -> REPLY_ (line-edited)
+    REPLY_=""
+    printf '%s[%d;1H%s[K%s' "$ESC" "$ROWS" "$ESC" "$1"
+    tput cnorm 2>/dev/null
+    IFS= read -re REPLY_ || REPLY_=""
+    tput civis 2>/dev/null
+}
+tui_confirm() {   # PROMPT -> 0 when answered y
+    local k
+    printf '%s[%d;1H%s[K%s' "$ESC" "$ROWS" "$ESC" "$1"
+    IFS= read -rsn1 k || return 1
+    case "$k" in y|Y) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_tui() {
+    tui_supported || { cmd_menu; return; }
+    local line created tag state sid nwin npanes attached saved name new
+    tmpd; tui_caps
+    tui_refresh
+    tui_enter
+    while :; do
+        tui_draw
+        tui_key
+        if [ "$KEY" = timeout ]; then tui_refresh; continue; fi
+        line=""; [ "$N" -gt 0 ] && line="$(sed -n "$((SEL + 1))p" "$TMPD/tui")"
+        IFS="$TAB" read -r created tag state sid nwin npanes attached saved name <<< "$line"
+        MSG=""
+        case "$KEY" in
+            quit) return 0 ;;
+            up)   [ "$SEL" -gt 0 ] && SEL=$((SEL - 1)) ;;
+            down) [ "$SEL" -lt $((N - 1)) ] && SEL=$((SEL + 1)) ;;
+            pgup) SEL=$((SEL - LIST_ROWS)); [ "$SEL" -lt 0 ] && SEL=0 ;;
+            pgdn) SEL=$((SEL + LIST_ROWS)); [ "$SEL" -ge "$N" ] && SEL=$((N - 1)); [ "$SEL" -lt 0 ] && SEL=0 ;;
+            home) SEL=0 ;;
+            end)  SEL=$((N - 1)); [ "$SEL" -lt 0 ] && SEL=0 ;;
+            refresh) tui_refresh; MSG="refreshed" ;;
+            all)  if [ -n "$ALL" ]; then ALL=""; else ALL=all; fi; tui_refresh ;;
+            save) MSG="$(cmd_save -v 2>&1 | tail -n 1)"; tui_refresh ;;
+            new)
+                tui_prompt "Name for the new session (empty = numbered): "; new="$REPLY_"
+                case "$new" in *[.:]*) MSG="session names cannot contain '.' or ':'"; continue ;; esac
+                if [ -n "$new" ] && tmux has-session -t "=$new" 2>/dev/null; then
+                    MSG="a session named '$new' is already running"; continue
+                fi
+                tui_leave; cmd_new "$new"; in_tmux && return 0
+                tui_enter; tui_refresh ;;
+            enter)
+                [ -n "$line" ] || continue
+                if [ "$state" = inactive ]; then
+                    lock_acquire "$LOCK_WAIT" || { MSG="a save is in progress; try again"; continue; }
+                    tui_leave; resurrect_snapshot "$tag" "$name"; lock_release; sid="$NEWSID"
+                else
+                    tui_leave
+                fi
+                attach_sid "$sid"; in_tmux && return 0
+                tui_enter; tui_refresh ;;
+            delete)
+                [ -n "$line" ] || continue
+                if [ "$state" != inactive ]; then
+                    MSG="'$name' is running; kill it in tmux before deleting its snapshot"; continue
+                fi
+                if tui_confirm "Delete $(entry_label "$created" "$name")? [y/N] "; then
+                    rm -rf "$DEST_DIR/$tag"; MSG="deleted $(entry_label "$created" "$name")"; tui_refresh
+                fi ;;
+            rename)
+                [ -n "$line" ] || continue
+                tui_prompt "Rename '$name' to: "; new="$REPLY_"
+                [ -n "$new" ] || continue
+                case "$new" in *[.:]*) MSG="session names cannot contain '.' or ':'"; continue ;; esac
+                if [ "$state" = inactive ]; then
+                    meta_set "$DEST_DIR/$tag/meta" name "$new" && MSG="renamed to '$new'"
+                elif tmux rename-session -t "$sid" "$new" 2>/dev/null; then
+                    MSG="renamed to '$new'"
+                else
+                    MSG="rename failed (is '$new' already taken?)"
+                fi
+                tui_refresh ;;
+        esac
+    done
+}
+
+usage() {
+    sed -n '2,/^# bash 3.2/p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    type -P tmux > /dev/null 2>&1 || die "tmux not found in PATH"
+    local cmd="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        '')                 if [ -t 0 ] && [ -t 1 ]; then cmd_tui; else cmd_list; fi ;;
+        tui|pick)           cmd_tui ;;
+        menu)               cmd_menu ;;
+        list|ls)            cmd_list "$@" ;;
+        new|create)         cmd_new "$@" ;;
+        attach|a)           cmd_attach "$@" ;;
+        resurrect|restore|r) cmd_resurrect "$@" ;;
+        save|-s|--save)     cmd_save "$@" ;;
+        rm|delete|forget)   cmd_rm "$@" ;;
+        _replay)            cmd_replay "$@" ;;
+        help|-h|--help)     usage ;;
+        *)                  die "unknown command '$cmd' (see: tmux-session help)" ;;
+    esac
+}
+
+main "$@"
