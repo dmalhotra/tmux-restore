@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (C) 2024-2026 Dhairya Malhotra
+# SPDX-License-Identifier: Apache-2.0
+
 # tmux-save — snapshot all tmux sessions (panes, cwd, scrollback, editor cmd).
 #
 # Atomic: everything is written into a staging dir and only complete files are
